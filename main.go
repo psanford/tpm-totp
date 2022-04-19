@@ -2,15 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// 2fa is a two-factor authentication agent.
+// tpm-totp is a two-factor authentication agent.
 //
 // Usage:
 //
-//	2fa -add [-7] [-8] [-hotp] name
-//	2fa -list
-//	2fa [-clip] name
+//	tpm-totp -add [-7] [-8] [-hotp] name
+//	tpm-totp -list
+//	tpm-totp [-clip] name
 //
-// “2fa -add name” adds a new key to the 2fa keychain with the given name.
+// “tpm-totp -add name” adds a new key to the tpm-totp keychain with the given name.
 // It prints a prompt to standard error and reads a two-factor key from standard input.
 // Two-factor keys are short case-insensitive strings of letters A-Z and digits 2-7.
 //
@@ -20,42 +20,42 @@
 // By default the new key generates 6-digit codes; the -7 and -8 flags select
 // 7- and 8-digit codes instead.
 //
-// “2fa -list” lists the names of all the keys in the keychain.
+// “tpm-totp -list” lists the names of all the keys in the keychain.
 //
-// “2fa name” prints a two-factor authentication code from the key with the
-// given name. If “-clip” is specified, 2fa also copies the code to the system
+// “tpm-totp name” prints a two-factor authentication code from the key with the
+// given name. If “-clip” is specified, tpm-totp also copies the code to the system
 // clipboard.
 //
-// With no arguments, 2fa prints two-factor authentication codes from all
+// With no arguments, tpm-totp prints two-factor authentication codes from all
 // known time-based keys.
 //
 // The default time-based authentication codes are derived from a hash of
 // the key and the current time, so it is important that the system clock have
 // at least one-minute accuracy.
 //
-// The keychain is stored unencrypted in the text file $HOME/.2fa.
+// The keychain is stored unencrypted in the text file $HOME/.tpm-totp.
 //
 // Example
 //
-// During GitHub 2FA setup, at the “Scan this barcode with your app” step,
+// During GitHub TPM-TOTP setup, at the “Scan this barcode with your app” step,
 // click the “enter this text code instead” link. A window pops up showing
 // “your two-factor secret,” a short string of letters and digits.
 //
-// Add it to 2fa under the name github, typing the secret at the prompt:
+// Add it to tpm-totp under the name github, typing the secret at the prompt:
 //
-//	$ 2fa -add github
-//	2fa key for github: nzxxiidbebvwk6jb
+//	$ tpm-totp -add github
+//	tpm-totp key for github: nzxxiidbebvwk6jb
 //	$
 //
-// Then whenever GitHub prompts for a 2FA code, run 2fa to obtain one:
+// Then whenever GitHub prompts for a TPM-TOTP code, run tpm-totp to obtain one:
 //
-//	$ 2fa github
+//	$ tpm-totp github
 //	268346
 //	$
 //
 // Or to type less:
 //
-//	$ 2fa
+//	$ tpm-totp
 //	268346	github
 //	$
 //
@@ -64,8 +64,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha1"
 	"encoding/base32"
 	"encoding/binary"
 	"flag"
@@ -81,32 +79,34 @@ import (
 	"unicode"
 
 	"github.com/atotto/clipboard"
+	"github.com/psanford/tpm-totp/internal/tpm"
 )
 
 var (
-	flagAdd  = flag.Bool("add", false, "add a key")
-	flagList = flag.Bool("list", false, "list keys")
-	flagHotp = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
-	flag7    = flag.Bool("7", false, "generate 7-digit code")
-	flag8    = flag.Bool("8", false, "generate 8-digit code")
-	flagClip = flag.Bool("clip", false, "copy code to the clipboard")
+	flagAdd     = flag.Bool("add", false, "add a key")
+	flagList    = flag.Bool("list", false, "list keys")
+	flagHotp    = flag.Bool("hotp", false, "add key as HOTP (counter-based) key")
+	flag7       = flag.Bool("7", false, "generate 7-digit code")
+	flag8       = flag.Bool("8", false, "generate 8-digit code")
+	flagClip    = flag.Bool("clip", false, "copy code to the clipboard")
+	flagTPMPath = flag.String("tpm-path", "/dev/tpmrm0", "TPM Path")
 )
 
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
-	fmt.Fprintf(os.Stderr, "\t2fa -add [-7] [-8] [-hotp] keyname\n")
-	fmt.Fprintf(os.Stderr, "\t2fa -list\n")
-	fmt.Fprintf(os.Stderr, "\t2fa [-clip] keyname\n")
+	fmt.Fprintf(os.Stderr, "\ttpm-totp -add [-7] [-8] [-hotp] keyname\n")
+	fmt.Fprintf(os.Stderr, "\ttpm-totp -list\n")
+	fmt.Fprintf(os.Stderr, "\ttpm-totp [-clip] keyname\n")
 	os.Exit(2)
 }
 
 func main() {
-	log.SetPrefix("2fa: ")
+	log.SetPrefix("tpm-totp: ")
 	log.SetFlags(0)
 	flag.Usage = usage
 	flag.Parse()
 
-	k := readKeychain(filepath.Join(os.Getenv("HOME"), ".2fa"))
+	k := readKeychain(filepath.Join(os.Getenv("HOME"), ".tpm-totp"))
 
 	if *flagList {
 		if flag.NArg() != 0 {
@@ -146,9 +146,9 @@ type Keychain struct {
 }
 
 type Key struct {
-	raw    []byte
-	digits int
-	offset int // offset of counter
+	keyHandle string
+	digits    int
+	offset    int // offset of counter
 }
 
 const counterLen = 20
@@ -180,24 +180,21 @@ func readKeychain(file string) *Keychain {
 			var k Key
 			name := string(f[0])
 			k.digits = int(f[1][0] - '0')
-			raw, err := decodeKey(string(f[2]))
-			if err == nil {
-				k.raw = raw
-				if len(f) == 3 {
+			k.keyHandle = string(f[2])
+			if len(f) == 3 {
+				c.keys[name] = k
+				continue
+			}
+			if len(f) == 4 && len(f[3]) == counterLen {
+				_, err := strconv.ParseUint(string(f[3]), 10, 64)
+				if err == nil {
+					// Valid counter.
+					k.offset = offset - counterLen
+					if line[len(line)-1] == '\n' {
+						k.offset--
+					}
 					c.keys[name] = k
 					continue
-				}
-				if len(f) == 4 && len(f[3]) == counterLen {
-					_, err := strconv.ParseUint(string(f[3]), 10, 64)
-					if err == nil {
-						// Valid counter.
-						k.offset = offset - counterLen
-						if line[len(line)-1] == '\n' {
-							k.offset--
-						}
-						c.keys[name] = k
-						continue
-					}
 				}
 			}
 		}
@@ -235,18 +232,24 @@ func (c *Keychain) add(name string) {
 		size = 8
 	}
 
-	fmt.Fprintf(os.Stderr, "2fa key for %s: ", name)
+	fmt.Fprintf(os.Stderr, "tpm-totp key for %s: ", name)
 	text, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		log.Fatalf("error reading key: %v", err)
 	}
 	text = strings.Map(noSpace, text)
 	text += strings.Repeat("=", -len(text)&7) // pad to 8 bytes
-	if _, err := decodeKey(text); err != nil {
+	key, err := decodeKey(text)
+	if err != nil {
 		log.Fatalf("invalid key: %v", err)
 	}
 
-	line := fmt.Sprintf("%s %d %s", name, size, text)
+	handle, err := makeKeyHandle(key)
+	if err != nil {
+		log.Fatalf("tpm load key error: %s", err)
+	}
+
+	line := fmt.Sprintf("%s %d %s", name, size, handle)
 	if *flagHotp {
 		line += " " + strings.Repeat("0", 20)
 	}
@@ -278,7 +281,10 @@ func (c *Keychain) code(name string) string {
 			log.Fatalf("malformed key counter for %q (%q)", name, c.data[k.offset:k.offset+counterLen])
 		}
 		n++
-		code = hotp(k.raw, n, k.digits)
+		code, err = hotp(k.keyHandle, n, k.digits)
+		if err != nil {
+			log.Fatalf("hmac err: %s", err)
+		}
 		f, err := os.OpenFile(c.file, os.O_RDWR, 0600)
 		if err != nil {
 			log.Fatalf("opening keychain: %v", err)
@@ -291,7 +297,12 @@ func (c *Keychain) code(name string) string {
 		}
 	} else {
 		// Time-based key.
-		code = totp(k.raw, time.Now(), k.digits)
+		var err error
+		code, err = totp(k.keyHandle, time.Now(), k.digits)
+		if err != nil {
+			log.Fatalf("hmac err: %s", err)
+		}
+
 	}
 	return fmt.Sprintf("%0*d", k.digits, code)
 }
@@ -328,8 +339,17 @@ func decodeKey(key string) ([]byte, error) {
 	return base32.StdEncoding.DecodeString(strings.ToUpper(key))
 }
 
-func hotp(key []byte, counter uint64, digits int) int {
-	h := hmac.New(sha1.New, key)
+func hotp(keyHandle string, counter uint64, digits int) (int, error) {
+	dev, err := tpm.Open(*flagTPMPath)
+	if err != nil {
+		return -1, err
+	}
+
+	h, err := dev.LoadHMACKey(keyHandle)
+	if err != nil {
+		return -1, err
+	}
+
 	binary.Write(h, binary.BigEndian, counter)
 	sum := h.Sum(nil)
 	v := binary.BigEndian.Uint32(sum[sum[len(sum)-1]&0x0F:]) & 0x7FFFFFFF
@@ -337,9 +357,19 @@ func hotp(key []byte, counter uint64, digits int) int {
 	for i := 0; i < digits && i < 8; i++ {
 		d *= 10
 	}
-	return int(v % d)
+	return int(v % d), nil
 }
 
-func totp(key []byte, t time.Time, digits int) int {
+func totp(key string, t time.Time, digits int) (int, error) {
 	return hotp(key, uint64(t.UnixNano())/30e9, digits)
+}
+
+func makeKeyHandle(secret []byte) (string, error) {
+	dev, err := tpm.Open(*flagTPMPath)
+	if err != nil {
+		return "", fmt.Errorf("Open tpm err: %w", err)
+	}
+	defer dev.Close()
+
+	return dev.CreateKeyHandle(secret)
 }
